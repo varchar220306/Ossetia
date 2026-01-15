@@ -28,7 +28,7 @@ ACTUALITY_HOURS = 48     # не старше 2 суток
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-5s | %(message)s')
 logger = logging.getLogger(__name__)
-logging.getLogger("urllib3").setLevel(logging.WARNING)  # меньше спама в логах
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # ── Утилиты ─────────────────────────────────────────────────
 def normalize(url):
@@ -43,7 +43,7 @@ def save_posted(link):
 
 def clean_text(html):
     if not html: return ""
-    soup = BeautifulSoup(html, "lxml")  # быстрее и меньше памяти
+    soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "iframe"]): tag.decompose()
     for p in soup.find_all("p"): p.replace_with(p.get_text(strip=True) + "\n\n")
     return re.sub(r'\n{3,}', '\n\n', soup.get_text(separator="\n").strip())
@@ -65,7 +65,6 @@ def extract_text(entry):
     return ""
 
 def find_media(entry):
-    # Видео → фото из RSS → фото из страницы
     if hasattr(entry, "media_content") and entry.media_content:
         for m in entry.media_content:
             url = m.get("url")
@@ -128,7 +127,7 @@ def get_entry_date(entry):
 # ── Основная логика ─────────────────────────────────────────
 async def check_feeds(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now()
-    if now.hour < 7 or now.hour > 23:  # не постим ночью
+    if now.hour < 7 or now.hour > 23:
         logger.info("Ночное время — пропускаем цикл")
         return
 
@@ -197,7 +196,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.job_queue.run_repeating(check_feeds, interval=INTERVAL, first=10)
+
+    # Проверяем наличие JobQueue (на случай, если пакет не установлен полностью)
+    if app.job_queue is None:
+        logger.error("JobQueue не доступен! Убедитесь, что установлен python-telegram-bot[job-queue]")
+        # Fallback: простой цикл без job_queue (для теста)
+        import asyncio
+        async def loop():
+            while True:
+                await check_feeds(None)
+                await asyncio.sleep(INTERVAL)
+        asyncio.run(loop())
+    else:
+        app.job_queue.run_repeating(check_feeds, interval=INTERVAL, first=10)
+
     logger.info("Бот запущен")
     app.run_polling()
 
