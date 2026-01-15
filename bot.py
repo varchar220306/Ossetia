@@ -28,6 +28,7 @@ ACTUALITY_HOURS = 48     # не старше 2 суток
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-5s | %(message)s')
 logger = logging.getLogger(__name__)
+logging.getLogger("urllib3").setLevel(logging.WARNING)  # меньше спама в логах
 
 # ── Утилиты ─────────────────────────────────────────────────
 def normalize(url):
@@ -42,7 +43,7 @@ def save_posted(link):
 
 def clean_text(html):
     if not html: return ""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")  # быстрее и меньше памяти
     for tag in soup(["script", "style", "iframe"]): tag.decompose()
     for p in soup.find_all("p"): p.replace_with(p.get_text(strip=True) + "\n\n")
     return re.sub(r'\n{3,}', '\n\n', soup.get_text(separator="\n").strip())
@@ -58,17 +59,13 @@ def smart_truncate(text, threshold=100):
     return text[:pos + 1] if pos != -1 else text[:threshold]
 
 def extract_text(entry):
-    for field in [
-        entry.get("content", [{}])[0].get("value", ""),
-        entry.get("summary", ""),
-        entry.get("description", "")
-    ]:
+    for field in [entry.get("description", ""), entry.get("summary", ""), entry.get("content", [{}])[0].get("value", "")]:
         cleaned = clean_text(field)
         if len(cleaned.strip()) > 30: return cleaned
     return ""
 
 def find_media(entry):
-    # Приоритет: видео → фото из RSS → фото из страницы
+    # Видео → фото из RSS → фото из страницы
     if hasattr(entry, "media_content") and entry.media_content:
         for m in entry.media_content:
             url = m.get("url")
@@ -83,37 +80,40 @@ def find_media(entry):
                 if re.search(r"\.(mp4|m4v|mov|webm)$", url, re.I): return {"type": "video", "url": url}
                 if re.search(r"\.(jpe?g|png|webp|gif)$", url, re.I): return {"type": "photo", "url": url}
 
-    # Парсинг страницы — улучшенный для region15.ru
     link = getattr(entry, "link", None)
     if link:
         try:
             r = requests.get(link, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            # Специально для region15.ru: ищем в .entry-content или .post-thumbnail
+            soup = BeautifulSoup(r.text, "lxml")
             candidates = soup.select(".entry-content img, .post-thumbnail img, article img, img.size-full, img.wp-post-image")
             for img in candidates:
                 src = img.get("src") or img.get("data-src") or img.get("data-lazy-src")
                 if src and re.search(r"\.(jpe?g|png|webp)$", src, re.I):
-                    # Фильтр на большие картинки (игнорируем логотипы/маленькие)
                     if "logo" not in src.lower() and "avatar" not in src.lower():
-                        full_url = urljoin(link, src)
-                        # Проверяем размер (опционально, если нужно — добавьте requests.head)
-                        return {"type": "photo", "url": full_url}
-        except Exception as e:
-            logger.debug(f"Парсинг картинки не удался для {link}: {e}")
+                        return {"type": "photo", "url": urljoin(link, src)}
+        except:
+            pass
 
-    return None  # Если ничего — текст
+    return None
 
-def prepare_post(entry):
+def prepare_post(entry, source_name):
     title = (entry.title or "Без заголовка").strip()
     text = extract_text(entry)
     text = highlight(text)
     preview = smart_truncate(text)
 
     emoji = random.choice("📰📢🔥⚡🏔️🚨📍✨🎥")
-    message = f"{emoji} <b>{title}</b>\n\n{preview}\n\n<b>@osetia_lenta</b>"
+    if any(w in title.lower() for w in ["дтп", "авария", "происшествие"]):
+        emoji = "🚨"
+
+    message = (
+        f"{emoji} <b>{title}</b>\n\n"
+        f"{preview}\n\n"
+        f"<i>Источник: {source_name}</i>\n"
+        f"<b>@osetia_lenta</b>\n\n"
+        f"#Владикавказ #Осетия #Новости"
+    )
 
     return message, title
 
@@ -121,14 +121,17 @@ def get_entry_date(entry):
     for field in ['published_parsed', 'updated_parsed', 'created_parsed']:
         parsed = getattr(entry, field, None)
         if parsed:
-            try:
-                return datetime.fromtimestamp(mktime(parsed))
-            except:
-                pass
+            try: return datetime.fromtimestamp(mktime(parsed))
+            except: pass
     return datetime.now()
 
 # ── Основная логика ─────────────────────────────────────────
 async def check_feeds(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now()
+    if now.hour < 7 or now.hour > 23:  # не постим ночью
+        logger.info("Ночное время — пропускаем цикл")
+        return
+
     posted = load_posted()
     all_new_entries = []
 
@@ -144,7 +147,7 @@ async def check_feeds(context: ContextTypes.DEFAULT_TYPE):
                 if norm_link in posted: continue
 
                 pub_date = get_entry_date(entry)
-                if pub_date < datetime.now() - timedelta(hours=ACTUALITY_HOURS):
+                if pub_date < now - timedelta(hours=ACTUALITY_HOURS):
                     continue
 
                 all_new_entries.append((pub_date, entry, source))
@@ -159,20 +162,20 @@ async def check_feeds(context: ContextTypes.DEFAULT_TYPE):
         if posted_count >= MAX_POSTS_PER_RUN:
             break
 
-        text, title = prepare_post(entry)
+        text, title = prepare_post(entry, source["name"])
         caption = text if len(text) <= 1024 else text[:1010] + "…"
 
         media = find_media(entry) if source.get("allow_media", False) else None
 
         try:
             if media and media["type"] == "video":
-                r = requests.get(media["url"], timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-                r.raise_for_status()
-                await context.bot.send_video(CHANNEL, r.content, caption=caption, parse_mode="HTML", supports_streaming=True)
+                with requests.get(media["url"], timeout=30, headers={"User-Agent": "Mozilla/5.0"}, stream=True) as r:
+                    r.raise_for_status()
+                    await context.bot.send_video(CHANNEL, r.raw, caption=caption, parse_mode="HTML", supports_streaming=True)
             elif media and media["type"] == "photo":
-                r = requests.get(media["url"], timeout=25, headers={"User-Agent": "Mozilla/5.0"})
-                r.raise_for_status()
-                await context.bot.send_photo(CHANNEL, r.content, caption=caption, parse_mode="HTML")
+                with requests.get(media["url"], timeout=25, headers={"User-Agent": "Mozilla/5.0"}, stream=True) as r:
+                    r.raise_for_status()
+                    await context.bot.send_photo(CHANNEL, r.raw, caption=caption, parse_mode="HTML")
             else:
                 await context.bot.send_message(CHANNEL, caption, parse_mode="HTML")
 
