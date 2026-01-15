@@ -22,9 +22,9 @@ SOURCES = [
 ]
 
 DB = "posted.txt"
-INTERVAL = 900           # 15 минут
+INTERVAL = 900
 MAX_POSTS_PER_RUN = 1
-ACTUALITY_HOURS = 48     # не старше 2 суток
+ACTUALITY_HOURS = 48
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-5s | %(message)s')
 logger = logging.getLogger(__name__)
@@ -44,9 +44,18 @@ def save_posted(link):
 def clean_text(html):
     if not html: return ""
     soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "iframe"]): tag.decompose()
+    for tag in soup(["script", "style", "iframe", "figure"]): tag.decompose()
     for p in soup.find_all("p"): p.replace_with(p.get_text(strip=True) + "\n\n")
-    return re.sub(r'\n{3,}', '\n\n', soup.get_text(separator="\n").strip())
+
+    text = soup.get_text(separator="\n", strip=True)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    # Удаляем "водяные" фразы WP-плагинов
+    text = re.sub(r'(?i)The post.*appeared first on.*', '', text)
+    text = re.sub(r'(?i)appeared first on.*', '', text)
+    text = re.sub(r'(?i)Источник:.*ГТРК «Алания».*', '', text)
+    text = re.sub(r'(?i)First published.*', '', text)  # на всякий
+    return text.strip()
 
 def highlight(text):
     for word in ["Владикавказ", "Северная Осетия", "Алания", "Осетия", "ДТП"]:
@@ -59,9 +68,15 @@ def smart_truncate(text, threshold=100):
     return text[:pos + 1] if pos != -1 else text[:threshold]
 
 def extract_text(entry):
-    for field in [entry.get("description", ""), entry.get("summary", ""), entry.get("content", [{}])[0].get("value", "")]:
-        cleaned = clean_text(field)
-        if len(cleaned.strip()) > 30: return cleaned
+    candidates = [
+        entry.get("content", [{}])[0].get("value", ""),
+        entry.get("summary", ""),
+        entry.get("description", "")
+    ]
+    for field in candidates:
+        if field:
+            cleaned = clean_text(field)
+            if len(cleaned.strip()) > 30: return cleaned
     return ""
 
 def find_media(entry):
@@ -197,10 +212,8 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
 
-    # Проверяем наличие JobQueue (на случай, если пакет не установлен полностью)
     if app.job_queue is None:
-        logger.error("JobQueue не доступен! Убедитесь, что установлен python-telegram-bot[job-queue]")
-        # Fallback: простой цикл без job_queue (для теста)
+        logger.error("JobQueue не доступен! Установите python-telegram-bot[job-queue]")
         import asyncio
         async def loop():
             while True:
